@@ -4,3 +4,4 @@ pandas
 plotly
 shinywidgets
 posit-sdk
+jupyter
