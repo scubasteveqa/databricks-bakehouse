@@ -1,0 +1,200 @@
+---
+title: "Databricks Dashboard (find by type)"
+format: dashboard
+server: shiny
+---
+
+```{python}
+#| context: setup
+import os
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from databricks import sql as dbsql
+from posit import connect
+from posit.connect.oauth import types
+from shiny import reactive, render, ui
+from shiny.express import input, session
+from shinywidgets import render_widget
+
+
+def fetch_databricks(access_token: str) -> pd.DataFrame:
+    conn = dbsql.connect(
+        server_hostname=os.environ["DATABRICKS_HOST"],
+        http_path=os.environ["DATABRICKS_HTTP_PATH"],
+        access_token=access_token,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    t.dateTime,
+                    t.product,
+                    t.quantity,
+                    t.totalPrice,
+                    c.continent,
+                    c.country,
+                    f.name AS franchise_name
+                FROM samples.bakehouse.sales_transactions t
+                JOIN samples.bakehouse.sales_customers c
+                    ON t.customerID = c.customerID
+                JOIN samples.bakehouse.sales_franchises f
+                    ON t.franchiseID = f.franchiseID
+            """)
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+    finally:
+        conn.close()
+    df = pd.DataFrame(rows, columns=cols)
+    df.columns = df.columns.str.lower()
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["month"] = df["datetime"].dt.to_period("M").astype(str)
+    return df
+```
+
+# {.sidebar}
+
+OAuth via `find_by(integration_type=DATABRICKS)`
+
+```{python}
+ui.input_action_button("load_data", "Refresh Data", class_="btn-primary w-100")
+ui.tags.script(
+    "setTimeout(function() { document.getElementById('load_data').click(); }, 500);"
+)
+ui.tags.hr()
+ui.input_select("continent", "Continent", choices=["All"], selected="All")
+ui.input_select("franchise", "Franchise", choices=["All"], selected="All")
+```
+
+```{python}
+raw_data = reactive.Value(None)
+
+@reactive.effect
+def load_all():
+    input.load_data()
+    session_token = session.http_conn.headers.get("Posit-Connect-User-Session-Token")
+    if not session_token:
+        ui.notification_show("No session token found. Deploy on Posit Connect.", type="error")
+        return
+
+    client = connect.Client()
+    current_content = client.content.get()
+
+    db_assoc = current_content.oauth.associations.find_by(
+        integration_type=types.OAuthIntegrationType.DATABRICKS
+    )
+    if db_assoc is None:
+        ui.notification_show("No Databricks integration found on this content", type="error")
+        return
+
+    db_guid = db_assoc.get("oauth_integration_guid")
+
+    try:
+        creds = client.oauth.get_credentials(session_token, audience=db_guid)
+        df = fetch_databricks(creds["access_token"])
+        raw_data.set(df)
+
+        continents = ["All"] + sorted(df["continent"].dropna().unique().tolist())
+        franchises = ["All"] + sorted(df["franchise_name"].dropna().unique().tolist())
+        ui.update_select("continent", choices=continents, selected="All")
+        ui.update_select("franchise", choices=franchises, selected="All")
+
+        ui.notification_show(f"Databricks: {len(df)} rows", type="message")
+    except Exception as e:
+        ui.notification_show(f"Databricks error: {e}", type="error", duration=10)
+
+@reactive.calc
+def filtered():
+    df = raw_data()
+    if df is None:
+        return None
+    if input.continent() != "All":
+        df = df[df["continent"] == input.continent()]
+    if input.franchise() != "All":
+        df = df[df["franchise_name"] == input.franchise()]
+    return df
+```
+
+# Databricks Bakehouse
+
+## Row
+
+::: {.valuebox title="Revenue" icon="currency-dollar" color="primary"}
+```{python}
+@render.text
+def total_revenue():
+    df = filtered()
+    return f"${df['totalprice'].sum():,.2f}" if df is not None else "--"
+```
+:::
+
+::: {.valuebox title="Orders" icon="cart" color="info"}
+```{python}
+@render.text
+def total_orders():
+    df = filtered()
+    return f"{len(df):,}" if df is not None else "--"
+```
+:::
+
+::: {.valuebox title="Franchises" icon="shop" color="warning"}
+```{python}
+@render.text
+def franchise_count():
+    df = filtered()
+    return str(df["franchise_name"].nunique()) if df is not None else "--"
+```
+:::
+
+## Row
+
+### Column
+
+```{python}
+#| title: Revenue by Franchise
+@render_widget
+def chart_franchise():
+    df = filtered()
+    if df is None:
+        fig = go.Figure()
+        fig.update_layout(title="Loading...", template="plotly_white")
+        return fig
+    agg = (
+        df.groupby("franchise_name", as_index=False)["totalprice"]
+        .sum()
+        .sort_values("totalprice", ascending=True)
+    )
+    return px.bar(agg, x="totalprice", y="franchise_name", orientation="h",
+                  labels={"totalprice": "Revenue ($)", "franchise_name": "Franchise"})
+```
+
+### Column
+
+```{python}
+#| title: Revenue by Continent
+@render_widget
+def chart_continent():
+    df = filtered()
+    if df is None:
+        fig = go.Figure()
+        fig.update_layout(title="Loading...", template="plotly_white")
+        return fig
+    agg = df.groupby("continent", as_index=False)["totalprice"].sum()
+    return px.pie(agg, names="continent", values="totalprice")
+```
+
+## Row
+
+```{python}
+#| title: Monthly Revenue Trend
+@render_widget
+def chart_trend():
+    df = filtered()
+    if df is None:
+        fig = go.Figure()
+        fig.update_layout(title="Loading...", template="plotly_white")
+        return fig
+    agg = df.groupby("month", as_index=False)["totalprice"].sum().sort_values("month")
+    return px.line(agg, x="month", y="totalprice", markers=True,
+                   labels={"totalprice": "Revenue ($)", "month": "Month"})
+```
